@@ -14,18 +14,12 @@ classdef D_HYBRID_FULL_SEQ < PROBLEM
 %   20    : GBRT
 %
 % Parameters:
-%   MSeq      --- [2 3 4 7 5]    --- Sequence of No. objectives
-%   TypeSeq   --- [2 2]   --- Sequence of Problem Types
-%   KSeq      --- [10 20]        --- Sequence of No. active variables
-%   taut      --- 20             --- Generations per stage
-%   seed      --- 1              --- Seed for ML models
-%
-% Logic:
-%   At stage t:
-%     Current M = MSeq(t)
-%     Current K = KSeq(t)
-%     Variables x_1...x_K are optimizable.
-%     Variables x_{K+1}...x_D are fixed to cFix (0.1).
+%   MSeq       --- [2 3 5]    --- Sequence of No. objectives
+%   TypeSeq    --- [2 2]   --- Sequence of Problem Types
+%   KSeq       --- [20 30 50]    --- Sequence of No. active variables
+%   taut       --- 50         --- Generations per stage
+%   seed       --- 1          --- Seed for ML models
+%   isDiscrete --- 0          --- 0: Continuous, 1: Discrete (25 levels)
 
     properties(SetAccess = private)
         % Dynamic Sequences
@@ -48,16 +42,19 @@ classdef D_HYBRID_FULL_SEQ < PROBLEM
         % ML Model Parameters
         ML_Params
         seed
+        
+        % [GUI控制] 离散化开关
+        isDiscrete 
     end
     
     methods
         %% Default settings
         function Setting(obj)
             % 1. Parameter parsing
-            % Input: MSeq, TypeSeq, KSeq, taut, seed
-            % Example defaults provided below
-            [obj.MSeq, obj.TypeSeq, obj.KSeq, obj.taut, obj.seed] = ...
-                obj.ParameterSet([2 3 4 7 5], [2 2], [10 20], 50, 1);
+            % Input: MSeq, TypeSeq, KSeq, taut, seed, isDiscrete
+            % [GUI修改点] 这里添加第6个参数，PlatEMO会在界面显示第6个输入框
+            [obj.MSeq, obj.TypeSeq, obj.KSeq, obj.taut, obj.seed, obj.isDiscrete] = ...
+                obj.ParameterSet([2 3 5], [2 2], [20 30 50], 50, 1, 0);
             
             % Normalize vectors
             obj.MSeq = obj.MSeq(:)';
@@ -172,6 +169,30 @@ classdef D_HYBRID_FULL_SEQ < PROBLEM
             
             % 3. Process Variables
             PopDec = obj.CalDec(varargin{1});
+            
+            % -------------------------------------------------------------
+            % [逻辑] 根据GUI参数决定是否离散化
+            % -------------------------------------------------------------
+            if obj.isDiscrete > 0
+                [N, ~] = size(PopDec);
+                num_levels = 25; % 离散值的数量
+                
+                % 计算每个维度的步长 (Upper - Lower) / 24
+                step_size = (obj.upper - obj.lower) / (num_levels - 1);
+                
+                % 扩展为 N 行以便矩阵运算
+                LowerRep = repmat(obj.lower, N, 1);
+                StepRep  = repmat(step_size, N, 1);
+                UpperRep = repmat(obj.upper, N, 1);
+
+                % 执行离散化：量化到最近的网格点
+                PopDec = round((PopDec - LowerRep) ./ StepRep) .* StepRep + LowerRep;
+                
+                % 边界保护
+                PopDec = max(PopDec, LowerRep);
+                PopDec = min(PopDec, UpperRep);
+            end
+            % -------------------------------------------------------------
             
             % [CORE LOGIC]: Mask inactive variables
             % If current K < D, force variables K+1...D to cFix
