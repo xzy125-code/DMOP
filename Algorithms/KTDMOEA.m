@@ -26,13 +26,12 @@ classdef KTDMOEA < ALGORITHM
             lastM = Problem.M;
             
             % Optimization Loop
-            % Algorithm.NotTerminated 会自动处理数据保存 (SavePoints)
             while Algorithm.NotTerminated(Population)
                 
                 % 1. Change Detection & Knowledge Transfer
                 currentM = Problem.M;
                 
-                % 检测环境是否发生变化（目标数变化）
+                % Detect if Number of Objectives (NObj) has changed
                 if currentM ~= lastM
                     if currentM > lastM
                         % Case: Increasing NObj -> PS Expansion [Algorithm 1]
@@ -50,11 +49,12 @@ classdef KTDMOEA < ALGORITHM
                 CrowdDis     = CrowdingDistance(Population.objs, FrontNo);
                 
                 % Mating Selection (Tournament)
+                % DTAEA logic: allows selection from small CA
                 MatingPool = TournamentSelection(2, Problem.N, FrontNo, CrowdDis);
                 Offspring  = OperatorGA(Problem, Population(MatingPool));
                 
                 % [CRITICAL]: Check for Dynamic Change happening DURING OperatorGA
-                % 有些问题会在评估过程中改变维度，需要二次检查
+                % Some dynamic problems might change dimensions during evaluation
                 if size(Offspring(1).objs, 2) ~= size(Population(1).objs, 2)
                     newM = size(Offspring(1).objs, 2);
                     oldM = size(Population(1).objs, 2);
@@ -64,15 +64,12 @@ classdef KTDMOEA < ALGORITHM
                         Population = Algorithm.PSContraction(Population, Problem);
                     end
                     lastM = newM;
-                    % 注意：如果这里发生了变化，EnvironmentSelection 需要小心，
-                    % 但通常下一轮循环会处理，或者在此处直接做简单的截断
-                    [FrontNo, ~] = NDSort(Population.objs, 1);
-                    CrowdDis = CrowdingDistance(Population.objs, FrontNo);
-                    [~, Rank] = sort(CrowdDis, 'descend');
-                    Population = Population(Rank(1:Problem.N));
+                    % Quick truncate using strictly non-dominated logic for consistency
+                    Population = Algorithm.UpdateCA(Population, Problem.N);
                 else
-                    % 3. Environmental Selection (Standard NSGA-II style)
-                    Population = Algorithm.EnvironmentalSelection([Population, Offspring], Problem.N);
+                    % 3. Population Update using DTAEA CA Update Mechanism
+                    % Combines Parent and Offspring, keeps ONLY non-dominated solutions
+                    Population = Algorithm.UpdateCA([Population, Offspring], Problem.N);
                 end
             end
         end
@@ -130,10 +127,12 @@ classdef KTDMOEA < ALGORITHM
             nRem = N - size(TransferredDecs, 1);
             if nRem > 0
                 SelectPool = OldPop;
+                % Priority: Select well-spaced solutions from OldPop
                 if length(SelectPool) > nRem
                      [~, rank] = sort(CrowdingDistance(SelectPool.objs), 'descend');
                      FillDecs = SelectPool(rank(1:nRem)).decs;
                 else
+                     % Fallback strategy
                      nNeed = nRem - length(SelectPool);
                      FillDecs = [SelectPool.decs; Problem.lower + rand(nNeed, Problem.D).*(Problem.upper - Problem.lower)];
                 end
@@ -146,7 +145,7 @@ classdef KTDMOEA < ALGORITHM
             NewPop = Problem.Evaluation(TransferredDecs);
         end
         
-        %% Algorithm 2: Search Expansion Direction (With Weight Vectors)
+        %% Algorithm 2: Search Expansion Direction
         function Dirs = SearchExpansionDirections(Algorithm, PSt, Problem, PSt_Decs)
             Dirs = [];
             
@@ -159,7 +158,7 @@ classdef KTDMOEA < ALGORITHM
             xe = Pe(randi(length(Pe)));
             xe_dec = xe.decs;
             
-            % Line 3: Generate Detective Population P_var
+            % Line 3: Generate Detective Population P_var around x_e
             N = Problem.N;
             RepXe = repmat(xe, N, 1);
             P_var_Decs = Algorithm.PolynomialMutation(RepXe.decs, Problem.lower, Problem.upper);
@@ -193,12 +192,10 @@ classdef KTDMOEA < ALGORITHM
             AllObjs = [PSt_New.objs; P_non.objs];
             Zmin = min(AllObjs, [], 1);
             Zmax = max(AllObjs, [], 1);
-            
             Zmax(Zmax == Zmin) = Zmax(Zmax == Zmin) + 1e-6;
             
             % 3. Identify occupied subareas by PSt
             OccupiedRegions = false(1, size(W, 1));
-            
             PSt_Norm = (PSt_New.objs - Zmin) ./ (Zmax - Zmin);
             for i = 1 : length(PSt_New)
                 norm_sol = sqrt(sum(PSt_Norm(i,:).^2));
@@ -222,6 +219,7 @@ classdef KTDMOEA < ALGORITHM
                 cosine = (P_non_Norm(i,:) * W') ./ norm_sol;
                 [~, regionIdx] = max(cosine);
                 
+                % Keep solution only if its region is NOT occupied by old PS
                 if ~OccupiedRegions(regionIdx)
                     KeepIdx(i) = true;
                 end
@@ -273,7 +271,7 @@ classdef KTDMOEA < ALGORITHM
                 nrm = norm(vec);
                 if nrm > 1e-10
                     D = vec / nrm;
-                    % Calculate C (Eq. 4)
+                    % Calculate C (similar to Eq. 4)
                     diff_upper = (Problem.upper - xe.decs) ./ D;
                     diff_lower = (Problem.lower - xe.decs) ./ D;
                     cand = [diff_upper, diff_lower];
@@ -311,14 +309,27 @@ classdef KTDMOEA < ALGORITHM
             NewPop = Problem.Evaluation(TransferredDecs);
         end
         
-        %% Helper: Environmental Selection (Robust NSGA-II style)
-        function Population = EnvironmentalSelection(Algorithm, Population, N)
-             [FrontNo, MaxFNo] = NDSort(Population.objs, Population.cons, N);
-             Next = FrontNo < MaxFNo;
-             Last = find(FrontNo == MaxFNo);
-             [~, Rank] = sort(CrowdingDistance(Population(Last).objs), 'descend');
-             Next(Last(Rank(1:N-sum(Next)))) = true;
-             Population = Population(Next);
+        %% Helper: CA Update Mechanism (Strict DTAEA CA Logic)
+        function Population = UpdateCA(Algorithm, MixedPop, N)
+            % 1. Remove Duplicates in Objective Space
+            [~, uniqueIdx] = unique(MixedPop.objs, 'rows');
+            MixedPop = MixedPop(uniqueIdx);
+            
+            % 2. Non-Dominated Sorting
+            [FrontNo, ~] = NDSort(MixedPop.objs, 1);
+            
+            % 3. Select strictly Non-Dominated Solutions (FrontNo == 1)
+            % This is the key difference from NSGA-II selection.
+            Next = FrontNo == 1;
+            Population = MixedPop(Next);
+            
+            % 4. Truncate if size exceeds N
+            if length(Population) > N
+                [~, Rank] = sort(CrowdingDistance(Population.objs), 'descend');
+                Population = Population(Rank(1:N));
+            end
+            % NOTE: If length(Population) < N, it remains smaller than N. 
+            % The CA is an archive of the best found solutions.
         end
         
         %% Helper: Polynomial Mutation (Standard)
