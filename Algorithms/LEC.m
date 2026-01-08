@@ -1,7 +1,7 @@
 classdef LEC < ALGORITHM
 % <multi/many> <real/integer/label/binary/permutation> <dynamic>
 % Learning to Expand and Contract Pareto Sets
-% lambda --- 20 --- Parameter for contraction sampling
+% lambda --- 20 --- Parameter for contraction sampling (popsize/20)
 
 %------------------------------- Reference --------------------------------
 % G. Ruan, L. L. Minku, S. Menzel, B. Sendhoff, and X. Yao, "Learning to
@@ -11,13 +11,26 @@ classdef LEC < ALGORITHM
 %--------------------------------------------------------------------------
 
     properties
-        lambda = 20; % Parameter for contraction sampling
+        lambda = 20;    % Contraction sampling parameter
+        W;              % Weight Vectors (Decomposition)
+        Neighbors;      % Neighborhood index (Decomposition)
+        T = 20;         % Neighborhood size
+        delta = 0.9;    % Probability of choosing parents from neighborhood
     end
 
     methods
         function main(Algorithm, Problem)
             % Parameter setting
             Algorithm.lambda = Algorithm.ParameterSet(20);
+            
+            % 1. Initialization (Decomposition Strategy Setup)
+            % Generate Weight Vectors and Neighborhoods based on initial M
+            % [FIX]: Sync Problem.N with the generated weights
+            [Algorithm.W, Problem.N] = Algorithm.UniformPoint(Problem.N, Problem.M);
+            Algorithm.T = min(Problem.N, 20); 
+            Algorithm.Neighbors = pdist2(Algorithm.W, Algorithm.W, 'euclidean');
+            [~, Algorithm.Neighbors] = sort(Algorithm.Neighbors, 2);
+            Algorithm.Neighbors = Algorithm.Neighbors(:, 1:Algorithm.T);
             
             % Initialize Population
             Population = Problem.Initialization();
@@ -29,29 +42,61 @@ classdef LEC < ALGORITHM
             while Algorithm.NotTerminated(Population)
                 currentM = Problem.M;
                 
-                % 1. Change Detection & Knowledge Transfer
+                % 2. Change Detection & Knowledge Transfer
                 if currentM ~= lastM
+                    % [CRITICAL FIX]: Update Problem.N when Weights change!
+                    [Algorithm.W, Problem.N] = Algorithm.UniformPoint(Problem.N, currentM);
+                    
+                    % Re-calculate Neighbors with new size
+                    Algorithm.T = min(Problem.N, 20);
+                    Algorithm.Neighbors = pdist2(Algorithm.W, Algorithm.W, 'euclidean');
+                    [~, Algorithm.Neighbors] = sort(Algorithm.Neighbors, 2);
+                    Algorithm.Neighbors = Algorithm.Neighbors(:, 1:Algorithm.T);
+                    
                     if currentM > lastM
-                        % Case: Increasing NObj -> Learning PS Expansion
+                        % Case: Increasing NObj
                         Population = Algorithm.PSExpansion(Population, Problem, lastM);
                     elseif currentM < lastM
-                        % Case: Decreasing NObj -> Learning PS Contraction
+                        % Case: Decreasing NObj
                         Population = Algorithm.PSContraction(Population, Problem, lastM);
                     end
                     lastM = currentM;
+                    
+                    % Ensure Population size matches the NEW Problem.N
+                    if length(Population) ~= Problem.N
+                         Population = Algorithm.DensitySelection(Population, Problem.N, currentM);
+                    end
                 end
                 
-                % 2. Evolutionary Optimization Process
-                [FrontNo, ~] = NDSort(Population.objs, Population.cons, inf);
-                CrowdDis     = CrowdingDistance(Population.objs, FrontNo);
+                % 3. Mating Selection (Decomposition Framework / KTDMOEA style)
+                MatingPool = zeros(1, Problem.N);
+                for i = 1 : Problem.N
+                    % [SAFEGUARD]: Ensure i does not exceed Neighbors size
+                    if i > size(Algorithm.Neighbors, 1)
+                        P = randi(Problem.N);
+                    elseif rand < Algorithm.delta
+                        P = Algorithm.Neighbors(i, randi(Algorithm.T));
+                    else
+                        P = randi(Problem.N);
+                    end
+                    MatingPool(i) = P;
+                end
                 
-                MatingPool = TournamentSelection(2, Problem.N, FrontNo, CrowdDis);
-                Offspring  = OperatorGA(Problem, Population(MatingPool));
+                % Generate Offspring
+                Offspring = OperatorGA(Problem, Population(MatingPool));
                 
-                % Handle Dynamic Change during Offspring Generation
+                % 4. Handle Dynamic Change during Offspring Generation
                 if size(Offspring(1).objs, 2) ~= size(Population(1).objs, 2)
                     newM = size(Offspring(1).objs, 2);
                     oldM = size(Population(1).objs, 2);
+                    
+                    % [CRITICAL FIX]: Update Problem.N here too
+                    [Algorithm.W, Problem.N] = Algorithm.UniformPoint(Problem.N, newM);
+                    
+                    Algorithm.T = min(Problem.N, 20);
+                    Algorithm.Neighbors = pdist2(Algorithm.W, Algorithm.W, 'euclidean');
+                    [~, Algorithm.Neighbors] = sort(Algorithm.Neighbors, 2);
+                    Algorithm.Neighbors = Algorithm.Neighbors(:, 1:Algorithm.T);
                     
                     if newM > oldM
                         Population = Algorithm.PSExpansion(Population, Problem, oldM);
@@ -60,25 +105,23 @@ classdef LEC < ALGORITHM
                     end
                     lastM = newM;
                     
-                    [FrontNo, ~] = NDSort(Population.objs, 1);
-                    CrowdDis = CrowdingDistance(Population.objs, FrontNo);
-                    [~, Rank] = sort(CrowdDis, 'descend');
-                    Population = Population(Rank(1:Problem.N));
+                    % Re-select to fit new Problem.N
+                    Population = Algorithm.DensitySelection(Population, Problem.N, newM);
                 else
-                    % 3. Environmental Selection
-                    Population = Algorithm.EnvironmentalSelection([Population, Offspring], Problem.N);
+                    % 5. DTAEA Update Mechanism with Decomposition Density
+                    Population = Algorithm.DensitySelection([Population, Offspring], Problem.N, currentM);
                 end
             end
         end
 
-        %% Part 1: PS Expansion (Learning & Selecting & Expanding)
+        %% Part 1: PS Expansion
         function NewPop = PSExpansion(Algorithm, OldPop, Problem, oldM)
-            % Extract Old Pareto Set (PSt)
+            % Extract Old Pareto Set
             [FrontNo,~] = NDSort(OldPop.objs, 1);
             PSt = OldPop(FrontNo == 1);
             if isempty(PSt), PSt = OldPop; end
             
-            % 1. Learn Candidate Expansion Directions (Algorithm 1)
+            % 1. Learn Candidate Expansion Directions
             Dirs_Cand = [];
             if length(PSt) > 2
                 try
@@ -86,20 +129,12 @@ classdef LEC < ALGORITHM
                     nEig = min(size(Coeff, 2), oldM - 1);
                     if nEig > 0
                         EVs = Coeff(:, 1:nEig); 
-                        
-                        % Find vectors perpendicular to EVs (Null space)
                         NullBasis = null(EVs'); 
-                        
-                        % Generate N candidate directions using Latin Hypercube Sampling (LHS)
                         N = Problem.N;
                         nNull = size(NullBasis, 2);
-                        
                         if nNull > 0
-                            % [Cite: Algorithm 1, Line 4] Use LHS for sampling
                             Coefs = 2 * lhsdesign(N, nNull) - 1; 
-                            
                             Dirs_Cand = Coefs * NullBasis';
-                            % Normalize
                             len = sqrt(sum(Dirs_Cand.^2, 2));
                             Dirs_Cand = Dirs_Cand ./ (len + 1e-10);
                         end
@@ -109,23 +144,17 @@ classdef LEC < ALGORITHM
                 end
             end
             
-            % 2. Select Most Promising Directions (Algorithm 3)
+            % 2. Select Most Promising Directions
             D_exp = [];
+            OldP_NewEnv = Problem.Evaluation(PSt.decs); % Re-evaluate
+            
             if ~isempty(Dirs_Cand)
-                % Re-evaluate PSt in NEW environment for dominance check
-                OldP_NewEnv = Problem.Evaluation(PSt.decs);
-                
-                % [Cite: Algorithm 3, Line 1] "Randomly sample A solution x from OldP"
-                % Strict adherence to paper: Use a SINGLE base point for direction SELECTION.
                 idx = randi(length(PSt));
                 x_base = PSt(idx);
-                
                 for i = 1 : size(Dirs_Cand, 1)
                     D_vec = Dirs_Cand(i, :);
                     y_dec = Algorithm.GenerateSolution(x_base.decs, D_vec, Problem.lower, Problem.upper);
                     y = Problem.Evaluation(y_dec);
-                    
-                    % [Cite: Algorithm 3, Line 4] Check if y is non-dominated
                     dominated = false;
                     for k = 1 : length(OldP_NewEnv)
                         if all(OldP_NewEnv(k).objs <= y.objs) && any(OldP_NewEnv(k).objs < y.objs)
@@ -133,85 +162,72 @@ classdef LEC < ALGORITHM
                             break;
                         end
                     end
-                    
-                    if ~dominated
-                        D_exp = [D_exp; D_vec];
-                    end
+                    if ~dominated, D_exp = [D_exp; D_vec]; end
                 end
             end
             
-            % 3. Expand PS (Section III-C)
-            % [Modification: Strict Fallback Strategy]
-            % [Cite: Section III-C, Paragraph 2] "If no expansion... directions are found... 
-            % the population from the old environment is directly copied"
+            % 3. Expand PS
             if isempty(D_exp)
-                 % Fallback: Direct Copy (Re-evaluated on new objectives)
-                 NewPop = Problem.Evaluation(OldPop.decs);
-                 return; 
+                 NewPop = OldP_NewEnv; return; 
             end
             
-            % If directions found, proceed with Expansion
+            % Even Selection using local Weight Vectors for the OLD dimension
             N = Problem.N;
-            [~, rank] = sort(CrowdingDistance(PSt.objs), 'descend');
-            % [Cite: Section III-C-1] "evenly select some solutions... as base solutions"
-            BaseSols = PSt(rank(1:min(length(PSt), N)));
+            nSelect = min(length(PSt), N);
+            [W_old, ~] = Algorithm.UniformPoint(nSelect, oldM); 
+            Objs = PSt.objs;
+            [~, RegionIdx] = max(1 - pdist2(Objs, W_old, 'cosine'), [], 2);
+            
+            BaseSols = [];
+            usedRegions = unique(RegionIdx);
+            for i = 1 : length(usedRegions)
+                 regionMembers = PSt(RegionIdx == usedRegions(i));
+                 randIdx = randi(length(regionMembers));
+                 BaseSols = [BaseSols, regionMembers(randIdx)];
+            end
+            if isempty(BaseSols), BaseSols = PSt; end
             
             TransferredDecs = [];
             nDirs = size(D_exp, 1);
-            
             counter = 0;
             while size(TransferredDecs, 1) < N
                 counter = counter + 1;
                 idxBase = mod(counter - 1, length(BaseSols)) + 1;
                 x_i = BaseSols(idxBase).decs;
-                
                 idxDir = mod(counter - 1, nDirs) + 1;
                 D_vec = D_exp(idxDir, :);
-                
                 x_new = Algorithm.GenerateSolution(x_i, D_vec, Problem.lower, Problem.upper);
                 TransferredDecs = [TransferredDecs; x_new];
             end
-            
-            if size(TransferredDecs, 1) > N
-                TransferredDecs = TransferredDecs(1:N, :);
-            end
-            
-            NewPop = Problem.Evaluation(TransferredDecs);
+            NewPop = Problem.Evaluation(TransferredDecs(1:min(size(TransferredDecs,1), N), :));
         end
 
-        %% Part 2: PS Contraction (Learning & Selecting & Contracting)
+        %% Part 2: PS Contraction
         function NewPop = PSContraction(Algorithm, OldPop, Problem, oldM)
             [FrontNo,~] = NDSort(OldPop.objs, 1);
             PSt = OldPop(FrontNo == 1);
             if isempty(PSt), PSt = OldPop; end
+            OldP_NewEnv = Problem.Evaluation(PSt.decs); % Re-evaluate first
             
-            % 1. Learn Candidate Contraction Directions (Algorithm 2)
+            % 1. Learn Candidate Contraction Directions
             C_con = [];
             if length(PSt) >= oldM
                 try
                      [Coeff, ~, ~] = pca(PSt.decs);
                      nEig = min(size(Coeff, 2), oldM - 1);
-                     if nEig > 0
-                        C_con = Coeff(:, 1:nEig)'; 
-                     end
+                     if nEig > 0, C_con = Coeff(:, 1:nEig)'; end
                 catch
                     C_con = [];
                 end
             end
             
-            % 2. Select Most Promising Directions (Algorithm 4)
+            % 2. Select Most Promising Directions
             D_con = [];
             if ~isempty(C_con)
-                OldP_NewEnv = Problem.Evaluation(PSt.decs);
-                
-                % [Cite: Algorithm 4, Line 1] "Randomly sample A solution x from OldP"
-                % Strict adherence to paper: Use a SINGLE base point for direction SELECTION.
                 idx = randi(length(OldP_NewEnv));
                 x_base = OldP_NewEnv(idx); 
-                
                 for i = 1 : size(C_con, 1)
                     D_vec = C_con(i, :);
-                    % [Cite: Algorithm 4, Line 3] Generate floor(N/(m-1)) solutions
                     nGen = floor(Problem.N / max(1, (oldM - 1)));
                     Y_decs = [];
                     for k = 1 : nGen
@@ -219,35 +235,19 @@ classdef LEC < ALGORITHM
                         Y_decs = [Y_decs; y_dec];
                     end
                     Y = Problem.Evaluation(Y_decs);
-                    
-                    % [Cite: Algorithm 4, Line 6] Check if any y dominates x (Convergence check)
                     promising = false;
                     for k = 1 : length(Y)
                         if all(Y(k).objs <= x_base.objs) && any(Y(k).objs < x_base.objs)
-                            promising = true;
-                            break;
+                            promising = true; break;
                         end
                     end
-                    
-                    if promising
-                        D_con = [D_con; D_vec];
-                    end
+                    if promising, D_con = [D_con; D_vec]; end
                 end
             end
             
-            % 3. Contract PS (Section III-C)
-            % [Modification: Strict Fallback Strategy]
-            % [Cite: Section III-C] "If no... directions are found... directly copied"
+            % 3. Contract PS
             if isempty(D_con)
-                % Fallback: Direct Copy
-                NewPop = Problem.Evaluation(OldPop.decs);
-                return;
-            end
-            
-            % If directions found, proceed with Contraction
-            % Need to ensure OldP_NewEnv is available if we didn't enter the loop above
-            if ~exist('OldP_NewEnv', 'var')
-                 OldP_NewEnv = Problem.Evaluation(PSt.decs);
+                NewPop = OldP_NewEnv; return;
             end
             
             nBase = floor(Problem.N / Algorithm.lambda); 
@@ -257,7 +257,6 @@ classdef LEC < ALGORITHM
             
             P_g_Decs = [];
             N_con = size(D_con, 1);
-            
             for i = 1 : length(P_base)
                 x_i = P_base(i).decs;
                 for j = 1 : N_con
@@ -270,41 +269,32 @@ classdef LEC < ALGORITHM
                     end
                 end
             end
-            
             P_g = Problem.Evaluation(P_g_Decs);
+            
             Combined = [OldP_NewEnv, P_g];
-            NewPop = Algorithm.DensitySelection(Combined, Problem.N);
+            currentM = size(Combined(1).objs, 2);
+            NewPop = Algorithm.DensitySelection(Combined, Problem.N, currentM);
         end
         
         %% Helper Functions
         function x_new = GenerateSolution(~, x, D_vec, lower, upper)
             D_vec(abs(D_vec) < 1e-10) = 1e-10; 
-            
-            % [Cite: Equation (3)] Calculate step size 'ss' based on boundary distance
             para = zeros(size(x));
             maskPos = D_vec > 0;
             maskNeg = ~maskPos;
             para(maskPos) = (upper(maskPos) - x(maskPos)) ./ D_vec(maskPos);
             para(maskNeg) = (lower(maskNeg) - x(maskNeg)) ./ D_vec(maskNeg);
-            
             ss = min(para);
             if ss < 0, ss = 0; end
-            
-            % [Cite: Equation (2)] x_new = x + ss * rand() * D
             x_new = x + ss * rand() * D_vec;
             x_new = max(min(x_new, upper), lower);
         end
         
-        function Population = EnvironmentalSelection(~, Population, N)
-             [FrontNo, MaxFNo] = NDSort(Population.objs, Population.cons, N);
-             Next = FrontNo < MaxFNo;
-             Last = find(FrontNo == MaxFNo);
-             [~, Rank] = sort(CrowdingDistance(Population(Last).objs), 'descend');
-             Next(Last(Rank(1:N-sum(Next)))) = true;
-             Population = Population(Next);
-        end
-        
-        function Population = DensitySelection(Algorithm, Population, N)
+        function Population = DensitySelection(Algorithm, Population, N, M)
+            % The "DTAEA Update Mechanism" combined with 
+            % "Decomposition-based density estimation"
+            
+            % 1. Non-dominated Sorting
             [FrontNo, MaxFNo] = NDSort(Population.objs, Population.cons, N);
             Next = FrontNo < MaxFNo;
             Last = find(FrontNo == MaxFNo);
@@ -313,33 +303,45 @@ classdef LEC < ALGORITHM
             nLast = length(Last);
             nNeed = N - nNext;
             
+            % 2. Decomposition-based Selection
             if nNeed > 0
                 LastSols = Population(Last);
-                M = size(LastSols(1).objs, 2);
-                [W, ~] = Algorithm.UniformPoint(N, M);
+                % Use Algorithm.W if it matches M, otherwise re-generate locally
+                if size(Algorithm.W, 2) == M
+                     W_current = Algorithm.W;
+                else
+                     [W_current, ~] = Algorithm.UniformPoint(N, M);
+                end
+                
                 Objs = LastSols.objs;
                 Zmin = min(Objs, [], 1);
                 Zmax = max(Objs, [], 1);
                 ObjsNorm = (Objs - Zmin) ./ (Zmax - Zmin + 1e-10);
                 
+                % Associate solutions with Reference Vectors (Decomposition)
                 RegionIdx = zeros(1, nLast);
                 for i = 1 : nLast
                     sol = ObjsNorm(i, :);
                     norm_sol = norm(sol);
                     if norm_sol == 0, norm_sol = 1e-6; end
-                    cosine = (sol * W') / norm_sol;
+                    cosine = (sol * W_current') / norm_sol;
                     [~, RegionIdx(i)] = max(cosine);
                 end
                 
+                % Niching / Diversity Maintenance
                 perm = randperm(nLast);
                 RegionIdx = RegionIdx(perm);
+                
+                % [FIX]: Force unique_idx to be a row vector
                 [~, unique_idx] = unique(RegionIdx, 'stable');
+                unique_idx = unique_idx(:)'; 
                 
                 if length(unique_idx) >= nNeed
                     SelectedPermIdx = unique_idx(1:nNeed);
                 else
                     SelectedPermIdx = unique_idx;
                     remaining = setdiff(1:nLast, unique_idx);
+                    % Both are row vectors now
                     SelectedPermIdx = [SelectedPermIdx, remaining(1:(nNeed - length(unique_idx)))];
                 end
                 RealSelectedIdx = perm(SelectedPermIdx);
